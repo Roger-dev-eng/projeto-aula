@@ -1,0 +1,102 @@
+# Pipeline: roda a cada git push na main (ou manualmente, pelo botão "Run workflow").
+#   CI = conferir se o código está bom (lint, build, imagem).
+#   CD = entregar no cluster (EKS), só se a infra estiver de pé.
+name: Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Por padrão o token do workflow só lê. O cd pede mais (id-token) por conta própria.
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI (conferir o código)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v7
+
+      - name: Instalar o Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: front/package-lock.json
+
+      - name: Instalar dependências do front
+        run: npm ci
+        working-directory: front
+
+      - name: Lint do front
+        run: npm run lint
+        working-directory: front
+
+      - name: Build do front
+        run: npm run build
+        working-directory: front
+
+      - name: Build da imagem do back
+        run: docker build back
+
+  cd:
+    name: CD (entregar no EKS)
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # deixa o GitHub provar quem é o workflow (OIDC)
+      contents: read
+    env:
+      # Sem senha da AWS: o segredo guarda só o ARN de um papel, que o GitHub assume via OIDC.
+      # Segredo vazio = infra desligada.
+      PAPEL: ${{ secrets.AWS_PAPEL_CICD }}
+    steps:
+      - name: Avisar que o deploy foi pulado
+        if: env.PAPEL == ''
+        run: |
+          echo "Infra desligada: deploy pulado"
+
+      - name: Baixar o código
+        if: env.PAPEL != ''
+        uses: actions/checkout@v7
+
+      - name: Entrar na AWS (OIDC, sem senha)
+        if: env.PAPEL != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.PAPEL }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Entrar no ECR
+        if: env.PAPEL != ''
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build e push da imagem (amd64)
+        if: env.PAPEL != ''
+        run: |
+          IMAGEM="${{ steps.ecr.outputs.registry }}/back:${GITHUB_SHA::7}"
+          docker build --platform linux/amd64 -t "$IMAGEM" back
+          docker push "$IMAGEM"
+          echo "IMAGEM=$IMAGEM" >> "$GITHUB_ENV"
+
+      - name: Conectar no cluster
+        if: env.PAPEL != ''
+        run: aws eks update-kubeconfig --name santo-projeto --region us-east-1
+
+      - name: Trocar a imagem no deployment.yaml
+        if: env.PAPEL != ''
+        run: |
+          sed -i "s|image: .*|image: $IMAGEM|" back/k8s/deployment.yaml
+
+      - name: Aplicar no cluster
+        if: env.PAPEL != ''
+        run: kubectl apply -f back/k8s/
+
+      - name: Esperar o rollout terminar
+        if: env.PAPEL != ''
+        run: kubectl rollout status deployment/back --timeout=5m
